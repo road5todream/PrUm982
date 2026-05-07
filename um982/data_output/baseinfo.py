@@ -1,3 +1,5 @@
+"""Состояние базовой станции: BASEINFO (Message ID 176)."""
+
 import struct
 from typing import Any, Dict, Optional
 
@@ -6,7 +8,11 @@ from um982.utils import parse_unicore_header
 
 from .base import _run_data_query
 
+# BASEINFO binary payload variants after 24-byte header:
+# - common: Status(4)+X,Y,Z(24)+StationID(8)+Reserved(4)+CRC(4) = 44
+# - some firmware: without Reserved => 40
 BASEINFO_BINARY_PAYLOAD_LEN = 44
+BASEINFO_BINARY_PAYLOAD_MIN_LEN = 40
 
 STATUS_VALID = 0
 STATUS_INVALID = 1
@@ -98,7 +104,7 @@ def _parse_baseinfo_ascii(data: bytes) -> Optional[dict]:
 
 def _parse_baseinfo_binary(data: bytes) -> Optional[dict]:
     """Парсинг бинарного BASEINFOB: заголовок 24 байта, затем payload 44 байта."""
-    min_len = 24 + BASEINFO_BINARY_PAYLOAD_LEN
+    min_len = 24 + BASEINFO_BINARY_PAYLOAD_MIN_LEN
     if len(data) < min_len:
         return None
     for i in range(len(data) - min_len + 1):
@@ -108,9 +114,12 @@ def _parse_baseinfo_binary(data: bytes) -> Optional[dict]:
         if not header or header.message_id != 176:
             continue
         offset = i + 24
-        if len(data) < offset + BASEINFO_BINARY_PAYLOAD_LEN:
-            continue
         try:
+            # Порядок попыток: сначала полный (44), затем укороченный (40).
+            available = len(data) - offset
+            payload_len = BASEINFO_BINARY_PAYLOAD_LEN if available >= BASEINFO_BINARY_PAYLOAD_LEN else BASEINFO_BINARY_PAYLOAD_MIN_LEN
+            if payload_len < BASEINFO_BINARY_PAYLOAD_MIN_LEN:
+                continue
             status = struct.unpack("<I", data[offset : offset + 4])[0]
             offset += 4
             x, y, z = struct.unpack("<ddd", data[offset : offset + 24])
@@ -118,9 +127,14 @@ def _parse_baseinfo_binary(data: bytes) -> Optional[dict]:
             station_id_bytes = data[offset : offset + 8]
             station_id = station_id_bytes.decode("ascii", errors="ignore").rstrip("\x00").strip()
             offset += 8
-            reserved = struct.unpack("<I", data[offset : offset + 4])[0]
-            offset += 4
-            # CRC at offset (4 bytes) — не разбираем, только проверяем длину
+            reserved = 0
+            if payload_len >= BASEINFO_BINARY_PAYLOAD_LEN:
+                reserved = struct.unpack("<I", data[offset : offset + 4])[0]
+                offset += 4
+            # CRC at offset (4 bytes) — читаем при наличии для диагностики.
+            crc_value = None
+            if len(data) >= offset + 4:
+                crc_value = struct.unpack("<I", data[offset : offset + 4])[0]
             return {
                 "format": "binary",
                 "status": status,
@@ -134,6 +148,7 @@ def _parse_baseinfo_binary(data: bytes) -> Optional[dict]:
                     "message_id": header.message_id,
                     "message_length": header.message_length,
                 },
+                "crc": f"0x{crc_value:08X}" if crc_value is not None else None,
             }
         except Exception:
             continue
@@ -158,9 +173,7 @@ def query_baseinfo(
         parse_func=_parse_baseinfo_message,
         binary=binary,
         add_crlf=add_crlf,
-        wait_time=0.5,
-        read_attempts=10,
-        read_timeout=1.5,
+        read_attempts=24,
         check_complete=_check_baseinfo_complete,
         result_key="baseinfo",
     )

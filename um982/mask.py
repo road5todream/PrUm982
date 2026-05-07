@@ -8,6 +8,14 @@ from .core import Um982Core
 
 
 def query_mask(core: Um982Core, add_crlf: Optional[bool] = None) -> Dict[str, Any]:
+    """
+    Query MASK configuration.
+
+    Sends command MASK; device responds with lines like:
+        $CONFIG,MASK,MASK 5.000000*15
+        $CONFIG,MASK,MASK GPS*4A
+        $CONFIG,MASK,GPSMaskPrn:12,*13
+    """
     if add_crlf is None:
         add_crlf = getattr(core, "baudrate", 460800) >= 460800
 
@@ -17,20 +25,27 @@ def query_mask(core: Um982Core, add_crlf: Optional[bool] = None) -> Dict[str, An
     if not core.send_ascii_command("MASK", add_crlf=add_crlf):
         return {"error": "Не удалось отправить команду MASK"}
 
-    time.sleep(0.3)
+    time.sleep(0.12)
     response = b""
-    start_time = time.time()
-    max_wait_time = 3.0
+    t0 = time.time()
+    last_data_at = t0
+    # Масок может быть много строк подряд; не обрываем приём на одном пустом read.
+    idle_after_data_s = 0.35
+    max_wait_first_byte_s = 1.2
+    max_total_s = 2.8
 
-    while time.time() - start_time < max_wait_time:
-        chunk = core.read_response(timeout=0.5)
+    while time.time() - t0 < max_total_s:
+        chunk = core.read_response(timeout=0.2)
         if chunk:
             response += chunk
-            start_time = time.time()
+            last_data_at = time.time()
         elif response:
-            break
+            if time.time() - last_data_at >= idle_after_data_s:
+                break
         else:
-            time.sleep(0.1)
+            if time.time() - t0 > max_wait_first_byte_s:
+                break
+            time.sleep(0.02)
 
     if not response:
         return {"error": "Ответ на MASK не получен"}

@@ -1,8 +1,9 @@
 """Логи/унилог: query_uniloglist, log, unlog, _parse_uniloglist_message."""
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from um982.core import Um982Core
+from um982.utils import format_log_period_wire, parse_log_period_str
 
 from .common import _run_data_query
 
@@ -12,6 +13,8 @@ def _send_config_command_via_core(
     command: str,
     command_name: str = "",
     add_crlf: Optional[bool] = None,
+    *,
+    accept_empty_response: bool = False,
 ) -> Dict[str, Any]:
     """Отправка CONFIG-подобной команды через Um982Core (send_ascii + read + parse)."""
     if add_crlf is None:
@@ -30,6 +33,20 @@ def _send_config_command_via_core(
         elif response:
             break
     if not response:
+        if accept_empty_response:
+            note = (
+                "Ответ не получен — после UNLOG это ожидаемо: приёмник может отключить вывод на COM."
+                if (command_name or "").upper() == "UNLOG"
+                else "Ответ не получен после отправки команды."
+            )
+            return {
+                "command": command,
+                "response": {"raw_bytes": b"", "parsed": {}},
+                "confirmation": None,
+                "success": True,
+                "empty_response_after_send": True,
+                "note": note,
+            }
         return {"error": "Ответ не получен"}
     parsed = core.parse_binary_response(response)
     messages = parsed.get("parsed", {}).get("messages", [])
@@ -85,9 +102,10 @@ def _parse_uniloglist_message(data: bytes, binary: bool = False) -> Optional[dic
             if next_msg_pos > semicolon_pos and next_msg_pos < semicolon_pos + 20000:
                 crc_pos = next_msg_pos
             else:
-                nmea_pos = text.find("$", semicolon_pos)
-                if nmea_pos > semicolon_pos and nmea_pos < semicolon_pos + 20000:
-                    crc_pos = nmea_pos
+                # Следующая ASCII-строка с «$» (не обязательно NMEA по гл. 7)
+                dollar_pos = text.find("$", semicolon_pos)
+                if dollar_pos > semicolon_pos and dollar_pos < semicolon_pos + 20000:
+                    crc_pos = dollar_pos
                 else:
                     crc_pos = min(len(text), semicolon_pos + 15000)
 
@@ -181,9 +199,8 @@ def query_uniloglist(
         parse_func=_parse_uniloglist_message,
         binary=False,
         add_crlf=add_crlf,
-        wait_time=0.5,
-        read_attempts=6,
-        read_timeout=1.0,
+        read_attempts=14,
+        max_wait=4.0,
         check_complete=_check_uniloglist_complete,
         result_key="uniloglist",
     )
@@ -208,24 +225,38 @@ def unlog(
     if message is not None and message.strip():
         parts.append(message.strip())
     command = " ".join(parts)
-    return _send_config_command_via_core(core, command, "UNLOG", add_crlf=add_crlf)
+    return _send_config_command_via_core(
+        core, command, "UNLOG", add_crlf=add_crlf, accept_empty_response=True
+    )
 
 
 def log(
     core: Um982Core,
     message: str,
     port: Optional[str] = None,
-    rate: int = 1,
+    rate: Union[int, float] = 1,
     add_crlf: Optional[bool] = None,
 ) -> Dict[str, Any]:
+    """
+    Включить вывод сообщения на COM-порт приёмника.
+
+    Формат как в скриптах восстановления и benchmark: «MSG [COMn] period»,
+    например BESTNAVA COM1 10 или BESTNAVA 1.5. Период — неотрицательное число (допускается дробь).
+    Ключевое слово ONTIME в команду не подставляем — на части прошивок оно ломает ожидаемый поток и фоновый разбор кадров в GUI.
+    """
     valid_ports = ("COM1", "COM2", "COM3")
     if port is not None:
         port_upper = port.upper().strip()
         if port_upper not in valid_ports:
             return {"error": f"Порт должен быть COM1, COM2 или COM3, получено: {port!r}"}
         port = port_upper
-    parts = [message.strip().upper(), str(rate)]
+    msg = message.strip().upper()
+    try:
+        rf = parse_log_period_str(rate)
+    except ValueError as e:
+        return {"error": f"Некорректный период (rate): {rate!r} ({e})"}
+    parts = [msg, format_log_period_wire(rf)]
     if port is not None:
         parts.insert(1, port)
     command = " ".join(parts)
-    return _send_config_command_via_core(core, command, message.strip().upper(), add_crlf=add_crlf)
+    return _send_config_command_via_core(core, command, msg, add_crlf=add_crlf)

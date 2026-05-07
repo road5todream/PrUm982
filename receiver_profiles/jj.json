@@ -1,0 +1,39 @@
+{
+  "_meta": {
+    "schema_version": 1,
+    "exported_at": "2026-04-30T10:32:44.670085+00:00",
+    "format": "um982_receiver_profile"
+  },
+  "config_set_commands": [
+    "CONFIG ANTENNA POWERON",
+    "CONFIG NMEAVERSION V410",
+    "CONFIG RTK TIMEOUT 600",
+    "CONFIG RTK RELIABILITY 3 1",
+    "CONFIG PPP TIMEOUT 300",
+    "CONFIG HEADING RELIABILITY 0",
+    "CONFIG HEADING FIXLENGTH",
+    "CONFIG HEADING LENGTH 0.00 0.00",
+    "CONFIG DGPS TIMEOUT 600",
+    "CONFIG RTCMB1CB2A ENABLE",
+    "CONFIG ANTENNADELTAHEN 0.0000 0.0000 0.0000",
+    "CONFIG PPS ENABLE GPS POSITIVE 500000 1000 0 0",
+    "CONFIG SIGNALGROUP 4 5",
+    "CONFIG ANTIJAM AUTO",
+    "CONFIG AGNSS DISABLE",
+    "CONFIG COM1 115200",
+    "CONFIG COM2 460800",
+    "CONFIG COM3 460800"
+  ],
+  "mask_commands": [
+    "MASK 5.0"
+  ],
+  "logs": [
+    {
+      "port": "COM2",
+      "message": "BESTNAVA",
+      "trigger": "ONTIME",
+      "period": 2.0
+    }
+  ],
+  "capture_warnings": {}
+}

@@ -1,28 +1,134 @@
 """Сырые наблюдения: OBSVM, OBSVH, OBSVMCMP, OBSVBASE — запросы и парсеры."""
 import re
 import struct
-import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from um982.core import Um982Core
-from um982.utils import parse_unicore_header
+from um982.utils import format_log_period_wire, parse_unicore_header
 
 from .base import _run_data_query
 from .common import find_unicore_sync
 
+# --- OBSVMCMP: Compressed Observation (Message ID 138), 24-byte records ---
+
 OBSVMCMP_RECORD_SIZE = 24
 OBSVMCMP_MESSAGE_ID = 138
 
+# PSR_STD_TABLE: index 0..15 -> psr_std in meters (doc Table)
 PSR_STD_TABLE: List[float] = [
     0.050, 0.075, 0.113, 0.169, 0.253, 0.380, 0.570, 0.854,
     1.281, 2.375, 4.750, 9.500, 19.000, 38.000, 76.000, 152.000,
 ]
 
+# ASCII OBSVMCMP: заголовок на первой строке, далее переносы строк и запятые между 48-символьными hex (§7.3.4).
+OBSVMCMP_ASCII_MESSAGE_RE = re.compile(rb"#OBSVMCMPA[\s\S]*?\*[0-9a-fA-F]{8}", re.IGNORECASE)
+
+# Table 7-54 — биты 16–18 поля ch-tr-status (OBSVM / OBSVH / OBSVMCMP).
+_NAV_SYSTEM_TABLE_7_54: Tuple[str, ...] = (
+    "GPS",
+    "GLONASS",
+    "SBAS",
+    "GAL",
+    "BDS",
+    "QZSS",
+    "IRNSS",
+    "?",
+)
+
+# Код сигнала — биты 21–27 (Table 7-54, «Signal type»), расшифровка зависит от системы.
+_GPS_QZSS_SIGNAL: Dict[int, str] = {
+    0: "L1 C/A",
+    3: "L1C pilot",
+    6: "L5 data",
+    9: "L2P (Y)",
+    11: "L1C data (semicodeless)",
+    14: "L5 pilot",
+    17: "L2C (L)",
+}
+_GLO_SIGNAL: Dict[int, str] = {
+    0: "L1 C/A",
+    5: "L2 C/A",
+    6: "G3I",
+    7: "G3Q",
+}
+_BDS_SIGNAL: Dict[int, str] = {
+    0: "B1I",
+    4: "B1Q",
+    5: "B2Q",
+    6: "B3Q",
+    8: "B1C (Pilot)",
+    12: "B2a (Pilot)",
+    13: "B2b (I)",
+    17: "B2I",
+    21: "B3I",
+    23: "B1C (Data)",
+    28: "B2a (Data)",
+}
+_GAL_SIGNAL: Dict[int, str] = {
+    1: "E1B",
+    2: "E1C",
+    12: "E5A pilot",
+    17: "E5B pilot",
+    18: "E6B",
+    22: "E6C",
+}
+_SBAS_SIGNAL: Dict[int, str] = {
+    0: "L1 C/A",
+    6: "L5 (I)",
+}
+_IRNSS_SIGNAL: Dict[int, str] = {
+    6: "L5 data",
+    14: "L5 pilot",
+}
+
+
+def nav_system_from_ch_tr_status(ch_tr_status: int) -> str:
+    code = (int(ch_tr_status) >> 16) & 0x7
+    return _NAV_SYSTEM_TABLE_7_54[code] if 0 <= code < len(_NAV_SYSTEM_TABLE_7_54) else "?"
+
+
+def obsv_signal_name_from_ch_tr(ch_tr_status: int) -> str:
+    """Имя сигнала по Table 7-54 (биты 21–27 + особый случай GPS L2P/L2C, бит 26)."""
+    st = int(ch_tr_status)
+    nav = nav_system_from_ch_tr_status(st)
+    code = (st >> 21) & 0x7F
+    if nav == "GPS":
+        if code == 9 and (st & 0x04000000):
+            return "L2C (L)"
+        return _GPS_QZSS_SIGNAL.get(code, f"код {code}")
+    if nav == "GLONASS":
+        return _GLO_SIGNAL.get(code, f"код {code}")
+    if nav == "QZSS":
+        return _GPS_QZSS_SIGNAL.get(code, f"код {code}")
+    if nav == "BDS":
+        return _BDS_SIGNAL.get(code, f"код {code}")
+    if nav == "GAL":
+        return _GAL_SIGNAL.get(code, f"код {code}")
+    if nav == "SBAS":
+        return _SBAS_SIGNAL.get(code, f"код {code}")
+    if nav == "IRNSS":
+        return _IRNSS_SIGNAL.get(code, f"код {code}")
+    return "—"
+
+
+def obsv_system_freq_field_text(system_freq: int, nav_system: str) -> str:
+    sf = int(system_freq)
+    if nav_system == "GLONASS":
+        return str(sf)
+    return "—"
+
+
+# Совместимость со старым именем
+def nav_system_from_obsvmcmp_channel_status(channel_tracking_status: int) -> str:
+    return nav_system_from_ch_tr_status(channel_tracking_status)
+
 
 def _obsvmcmp_get_bits(data: bytes, start_bit: int, num_bits: int) -> int:
     """
     Извлечь целое значение из битовой строки записи OBSVMCMP (24 байта = 192 бит).
+
+    Бит 0 = LSB первого байта (little-endian). Диапазон [start_bit, start_bit+num_bits).
     """
     if len(data) < OBSVMCMP_RECORD_SIZE or start_bit < 0 or num_bits <= 0:
         return 0
@@ -43,6 +149,7 @@ def _obsvmcmp_get_bits_signed(data: bytes, start_bit: int, num_bits: int) -> int
 @dataclass
 class ObsvmcmpRecord:
     """Одна сжатая запись OBSVMCMP (24 байта). Раскладка по битам из спецификации."""
+
     channel_tracking_status: int
     doppler_hz: float
     pseudorange_m: float
@@ -58,8 +165,13 @@ class ObsvmcmpRecord:
     raw_hex: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
+        nav = nav_system_from_ch_tr_status(self.channel_tracking_status)
+        sig = obsv_signal_name_from_ch_tr(self.channel_tracking_status)
         return {
             "channel_tracking_status": self.channel_tracking_status,
+            "channel_tracking_status_hex": f"0x{self.channel_tracking_status:08X}",
+            "nav_system": nav,
+            "signal_name": sig,
             "doppler_hz": self.doppler_hz,
             "pseudorange_m": self.pseudorange_m,
             "adr_cycles": self.adr_cycles,
@@ -128,9 +240,13 @@ def _parse_obsv_message(
                     ch_tr_status = struct.unpack("<I", data[offset : offset + 4])[0]
                     offset += 4
 
+                    nav = nav_system_from_ch_tr_status(ch_tr_status)
                     observations.append(
                         {
                             "system_freq": system_freq,
+                            "nav_system": nav,
+                            "signal_name": obsv_signal_name_from_ch_tr(ch_tr_status),
+                            "system_freq_note": obsv_system_freq_field_text(system_freq, nav),
                             "prn": prn,
                             "psr": psr,
                             "adr": adr,
@@ -168,8 +284,14 @@ def _parse_obsv_message(
 
     try:
         text = data.decode("ascii", errors="ignore")
-        pattern = rf"{re.escape(ascii_prefix)}[^\r\n]*"
-        for match in re.finditer(pattern, text):
+        # OBSV* в ASCII может идти многострочно до *CRC (особенно OBSVBASE).
+        pattern = rf"{re.escape(ascii_prefix)}[\s\S]*?\*[0-9a-fA-F]{{7,8}}"
+        matches = list(re.finditer(pattern, text))
+        if not matches:
+            # Обратная совместимость: короткие строки без полного CRC (тесты/старые логи).
+            pattern = rf"{re.escape(ascii_prefix)}[^\r\n]*"
+            matches = list(re.finditer(pattern, text))
+        for match in matches:
             line = match.group(0).strip()
             if not line:
                 continue
@@ -178,7 +300,7 @@ def _parse_obsv_message(
                 continue
             data_part = parts[1]
             data_part_clean = data_part.split("*")[0]
-            obs_fields = data_part_clean.split(",")
+            obs_fields = [f.strip() for f in re.split(r"[\r\n,]+", data_part_clean) if f.strip() != ""]
             if not obs_fields:
                 continue
             try:
@@ -208,9 +330,13 @@ def _parse_obsv_message(
                     ch_tr_status_str = obs_fields[field_idx + 10] if field_idx + 10 < len(obs_fields) else "0"
                     ch_tr_status = int(ch_tr_status_str, 16) if ch_tr_status_str else 0
 
+                    nav = nav_system_from_ch_tr_status(ch_tr_status)
                     observations.append(
                         {
                             "system_freq": system_freq,
+                            "nav_system": nav,
+                            "signal_name": obsv_signal_name_from_ch_tr(ch_tr_status),
+                            "system_freq_note": obsv_system_freq_field_text(system_freq, nav),
                             "prn": prn,
                             "psr": psr,
                             "adr": adr,
@@ -228,6 +354,76 @@ def _parse_obsv_message(
                     pass
                 finally:
                     field_idx += 11
+
+            # OBSVBASE ASCII на части прошивок приходит в компактном виде:
+            # obsNumber, system_freq, prn,psr,adr,psrStd,adrStd,dopp,CNO,reserved,locktime,chTrStatus, prn,psr,...
+            # Т.е. system_freq один раз, далее по 10 полей на наблюдение.
+            if not observations and obs_number > 0 and len(obs_fields) >= 12:
+                try:
+                    def _int_compact(s: str) -> int:
+                        return int(float(s)) if s else 0
+
+                    system_freq_compact = _int_compact(obs_fields[1])
+                    field_idx = 2
+                    for _ in range(obs_number):
+                        if field_idx >= len(obs_fields):
+                            break
+                        # Вариант 1 (классика): prn + 9 полей (включая dopp) = 10 токенов на запись.
+                        # Вариант 2 (UM982 sample): prn + 8 полей (без dopp) = 9 токенов на запись.
+                        rec_len = 10 if field_idx + 9 < len(obs_fields) else 9
+                        if rec_len == 10:
+                            # Если поле "dopp" выглядит как CNO (крупное целое), вероятно формат без dopp.
+                            t_dopp = obs_fields[field_idx + 5]
+                            try:
+                                maybe_dopp = float(t_dopp)
+                            except ValueError:
+                                maybe_dopp = 0.0
+                            if abs(maybe_dopp) > 1000:
+                                rec_len = 9
+                        if rec_len == 9 and field_idx + 8 >= len(obs_fields):
+                            break
+
+                        prn = _int_compact(obs_fields[field_idx])
+                        psr = float(obs_fields[field_idx + 1]) if obs_fields[field_idx + 1] else 0.0
+                        adr = float(obs_fields[field_idx + 2]) if obs_fields[field_idx + 2] else 0.0
+                        psr_std = _int_compact(obs_fields[field_idx + 3])
+                        adr_std = _int_compact(obs_fields[field_idx + 4])
+                        if rec_len == 10:
+                            dopp = float(obs_fields[field_idx + 5]) if obs_fields[field_idx + 5] else 0.0
+                            cn0 = _int_compact(obs_fields[field_idx + 6])
+                            reserved = _int_compact(obs_fields[field_idx + 7])
+                            locktime = float(obs_fields[field_idx + 8]) if obs_fields[field_idx + 8] else 0.0
+                            ch_tr_status_str = obs_fields[field_idx + 9]
+                        else:
+                            dopp = 0.0
+                            cn0 = _int_compact(obs_fields[field_idx + 5])
+                            reserved = _int_compact(obs_fields[field_idx + 6])
+                            locktime = float(obs_fields[field_idx + 7]) if obs_fields[field_idx + 7] else 0.0
+                            ch_tr_status_str = obs_fields[field_idx + 8]
+                        ch_tr_status = int(ch_tr_status_str, 16) if ch_tr_status_str else 0
+                        nav = nav_system_from_ch_tr_status(ch_tr_status)
+                        observations.append(
+                            {
+                                "system_freq": system_freq_compact,
+                                "nav_system": nav,
+                                "signal_name": obsv_signal_name_from_ch_tr(ch_tr_status),
+                                "system_freq_note": obsv_system_freq_field_text(system_freq_compact, nav),
+                                "prn": prn,
+                                "psr": psr,
+                                "adr": adr,
+                                "psr_std": psr_std / 100.0,
+                                "adr_std": adr_std / adr_std_divisor,
+                                "dopp": dopp,
+                                "cn0": cn0 / 100.0,
+                                "reserved": reserved,
+                                "locktime": locktime,
+                                "ch_tr_status": ch_tr_status,
+                                "ch_tr_status_hex": f"0x{ch_tr_status:08X}",
+                            }
+                        )
+                        field_idx += rec_len
+                except Exception:
+                    pass
 
             return {
                 "format": "ascii",
@@ -283,16 +479,22 @@ def _obsvbase_enrich_result(result: dict) -> dict:
     return out
 
 
+# Синхрослово альтернативного бинарного формата (не Unicore AA 44 B5)
 _RAW_FE7E_SYNC = bytes((0xFE, 0x7E))
 
 
 def _decode_raw_fe7e_format(data: bytes) -> Optional[dict]:
-    """Попытка расшифровать сырой ответ с синхрословом 0xFE 0x7E."""
+    """
+    Попытка расшифровать сырой ответ с синхрословом 0xFE 0x7E (проприетарный формат).
+    Гипотеза: 8 байт заголовок (FE 7E + 2 len + 2 type + 2 reserved), далее блоки по 40 байт.
+    Для каждого блока пробуем LE/BE и выводим raw_hex + попытку полей (раскладка может отличаться).
+    """
     if len(data) < 10:
         return None
     pos = data.find(_RAW_FE7E_SYNC)
     if pos < 0:
         return None
+    # Заголовок 8 байт от sync
     head = data[pos : pos + 8]
     if len(head) < 8:
         return None
@@ -302,6 +504,7 @@ def _decode_raw_fe7e_format(data: bytes) -> Optional[dict]:
     if len(payload) % block_size != 0:
         return None
     n_blocks = len(payload) // block_size
+    # Поля заголовка (гипотетические)
     len_le = struct.unpack("<H", head[2:4])[0]
     len_be = struct.unpack(">H", head[2:4])[0]
     msg_type_le = struct.unpack("<H", head[4:6])[0]
@@ -312,12 +515,14 @@ def _decode_raw_fe7e_format(data: bytes) -> Optional[dict]:
         if len(block) < 20:
             observations.append({"raw_hex": block.hex(), "decode_note": "block too short"})
             continue
+        # Попытка как Unicore-подобный блок: 2 sys, 2 prn, 8 psr, 8 adr, 2 psr_std, 2 adr_std, 4 dopp, 2 cn0, 2 res, 4 lock, 4 ch_status
         prn_le = struct.unpack("<H", block[2:4])[0]
         prn_be = struct.unpack(">H", block[2:4])[0]
         psr_le = struct.unpack("<d", block[4:12])[0] if len(block) >= 12 else None
         psr_be = struct.unpack(">d", block[4:12])[0] if len(block) >= 12 else None
         adr_le = struct.unpack("<d", block[12:20])[0] if len(block) >= 20 else None
         adr_be = struct.unpack(">d", block[12:20])[0] if len(block) >= 20 else None
+        # Выбираем правдоподобные: prn 1..37 или 1..24 GLONASS, psr ~1e7..3e7
         prn = prn_le if 1 <= prn_le <= 37 else (prn_be if 1 <= prn_be <= 37 else prn_le)
         psr = None
         if psr_le is not None and 1e7 <= abs(psr_le) <= 3e7:
@@ -375,6 +580,7 @@ def _parse_obsvbase_message(data: bytes, binary: bool = False) -> Optional[dict]
         ascii_prefix="#OBSVBASEA",
         adr_std_divisor=1000.0,
     )
+    # Если запрос был ASCII — пробуем бинарный разбор ответа
     if result is None and not binary:
         result = _parse_obsv_message(
             data,
@@ -383,6 +589,7 @@ def _parse_obsvbase_message(data: bytes, binary: bool = False) -> Optional[dict]
             ascii_prefix="#OBSVBASEA",
             adr_std_divisor=1000.0,
         )
+    # Если запрос был binary — пробуем ASCII разбор (устройство может ответить ASCII)
     if result is None and binary:
         result = _parse_obsv_message(
             data,
@@ -420,6 +627,9 @@ def _check_obsv_complete(
                     obs_num = struct.unpack("<I", data[i + 24 : i + 28])[0]
                     if obs_num > 0:
                         return True
+                    # Ноль наблюдений: без этого check_complete ждёт fallback_len и query «висит».
+                    if obs_num == 0 and len(data) >= i + 32:
+                        return True
         return len(data) > fallback_len
     try:
         if ascii_marker in data:
@@ -443,8 +653,29 @@ def _check_obsvbase_complete(data: bytes, is_binary: bool) -> bool:
     return _check_obsv_complete(data, is_binary, 284, b"#OBSVBASEA")
 
 
+def _check_obsvmcmp_complete(data: bytes, is_binary: bool) -> bool:
+    if not is_binary and OBSVMCMP_ASCII_MESSAGE_RE.search(data):
+        return True
+    return _check_obsv_complete(data, is_binary, OBSVMCMP_MESSAGE_ID, b"#OBSVMCMPA")
+
+
 def _decode_obsvmcmp_record(data: bytes) -> Optional[ObsvmcmpRecord]:
-    """Декодирование одной сжатой записи OBSVMCMP (24 байта) по битовой раскладке спецификации."""
+    """
+    Декодирование одной сжатой записи OBSVMCMP (24 байта) по битовой раскладке спецификации.
+
+    BIT_LAYOUT (bit 0 = LSB первого байта, little-endian):
+    - bits 0-31   : channel_tracking_status
+    - bits 32-59  : doppler, scale 1/256 Hz (signed)
+    - bits 60-95  : pseudorange, scale 1/128 m
+    - bits 96-127 : adr, scale 1/256 cycles (signed)
+    - bits 128-131: psr_std_index -> PSR_STD_TABLE
+    - bits 132-135: adr_std_index -> (n+1)/512 cycles
+    - bits 136-143: prn
+    - bits 144-164: lock_time, scale 1/32 s
+    - bits 165-169: cn0 = 20 + n dB-Hz
+    - bits 170-175: glonass_frequency_number (N+7)
+    - bits 176-191: reserved
+    """
     if len(data) < OBSVMCMP_RECORD_SIZE:
         return None
     try:
@@ -505,12 +736,67 @@ def _obsvmcmp_record_entry(
     record = _decode_obsvmcmp_record(compressed_data)
     hex_str = raw_hex_override if raw_hex_override is not None else compressed_data.hex()
     decoded = record.to_dict() if record else {"raw_hex": hex_str, "decode_error": "parse failed"}
-    return {
+    nav = decoded.get("nav_system") if isinstance(decoded, dict) else None
+    out: Dict[str, Any] = {
         "index": index,
         "raw_hex": hex_str,
         "raw_bytes": compressed_data,
         "decoded": decoded,
         "record": record,
+    }
+    if nav:
+        out["nav_system"] = nav
+    return out
+
+
+def _parse_obsvmcmp_ascii_block(block: bytes) -> Optional[dict]:
+    """
+    Разбор ASCII OBSVMCMP: первая строка до «;» — заголовок, далее до «*CRC» — число наблюдений и
+    записи по 48 hex-символов (24 байта), между ними запятые и переводы строк (§7.3.4).
+    """
+    block = block.strip()
+    if not re.match(rb"#OBSVMCMPA", block, flags=re.I):
+        return None
+    if b";" not in block:
+        return None
+    _head, rest = block.split(b";", 1)
+    rest = rest.strip()
+    if b"*" not in rest:
+        return None
+    data_only, _crc = rest.rsplit(b"*", 1)
+    data_only = data_only.replace(b"\r", b"").replace(b"\n", b"")
+    raw_tokens = [t.strip() for t in data_only.split(b",")]
+    parts = [t for t in raw_tokens if t]
+    if not parts:
+        return None
+    try:
+        obs_number = int(parts[0])
+    except ValueError:
+        return None
+    compressed_records: List[Dict[str, Any]] = []
+    hex_idx = 0
+    for tok in parts[1:]:
+        if len(tok) < 48:
+            continue
+        hx = tok[:48]
+        if not re.match(br"[0-9a-fA-F]{48}", hx):
+            continue
+        try:
+            record_bytes = bytes.fromhex(hx.decode("ascii"))
+        except ValueError:
+            continue
+        compressed_records.append(
+            _obsvmcmp_record_entry(record_bytes, hex_idx, raw_hex_override=hx.decode("ascii"))
+        )
+        hex_idx += 1
+        if hex_idx >= obs_number:
+            break
+    return {
+        "format": "ascii",
+        "obs_number": obs_number,
+        "parsed_records": len(compressed_records),
+        "compressed_records": compressed_records,
+        "note": "OBSVMCMP 24-byte compressed records per spec (Message ID 138)",
     }
 
 
@@ -524,7 +810,7 @@ def _parse_obsvmcmp_message(data: bytes, binary: bool = False) -> Optional[dict]
                 if header is None:
                     continue
                 msg_length = header.message_length
-                if msg_length <= 32 or len(data) < i + msg_length:
+                if msg_length < 32 or len(data) < i + msg_length:
                     continue
                 offset = i + 24
                 if len(data) < offset + 4:
@@ -532,7 +818,7 @@ def _parse_obsvmcmp_message(data: bytes, binary: bool = False) -> Optional[dict]
                 obs_number = struct.unpack("<I", data[offset : offset + 4])[0]
                 offset += 4
                 max_records_by_len = max(0, (msg_length - 24 - 4 - 4) // 24)
-                if max_records_by_len == 0:
+                if obs_number > 0 and max_records_by_len == 0:
                     continue
                 records_to_parse = min(obs_number, max_records_by_len)
                 compressed_records = []
@@ -562,44 +848,22 @@ def _parse_obsvmcmp_message(data: bytes, binary: bool = False) -> Optional[dict]
         return None
     else:
         try:
+            m = OBSVMCMP_ASCII_MESSAGE_RE.search(data)
+            if m:
+                out = _parse_obsvmcmp_ascii_block(m.group(0))
+                if out:
+                    out["raw"] = m.group(0).decode("ascii", errors="replace")
+                    return out
             text = data.decode("ascii", errors="ignore")
-            pattern = r"#OBSVMCMPA[^\r\n]*"
+            pattern = r"#OBSVMCMPA[^\r\n]*\*[0-9a-fA-F]{8}"
             for match in re.finditer(pattern, text):
                 line = match.group(0).strip()
                 if not line:
                     continue
-                parts = line.split(";")
-                if len(parts) < 2:
-                    continue
-                data_part = parts[1]
-                data_part_clean = data_part.split("*")[0]
-                fields = data_part_clean.split(",")
-                if not fields:
-                    continue
-                try:
-                    obs_number = int(fields[0])
-                except ValueError:
-                    continue
-                compressed_records = []
-                for idx in range(obs_number):
-                    if idx + 1 >= len(fields):
-                        break
-                    hex_record = fields[idx + 1]
-                    if len(hex_record) >= 48:
-                        try:
-                            record_bytes = bytes.fromhex(hex_record[:48])
-                            compressed_records.append(
-                                _obsvmcmp_record_entry(record_bytes, idx, raw_hex_override=hex_record[:48])
-                            )
-                        except ValueError:
-                            continue
-                return {
-                    "format": "ascii",
-                    "obs_number": obs_number,
-                    "compressed_records": compressed_records,
-                    "raw": line,
-                    "note": "OBSVMCMP 24-byte compressed records per spec (Message ID 138)",
-                }
+                out = _parse_obsvmcmp_ascii_block(line.encode("ascii", errors="surrogateescape"))
+                if out:
+                    out["raw"] = line
+                    return out
         except Exception:
             pass
     return None
@@ -607,8 +871,8 @@ def _parse_obsvmcmp_message(data: bytes, binary: bool = False) -> Optional[dict]
 
 def _query_obsv_rate(
     core: Um982Core,
-    port: str,
-    rate: int,
+    port: Optional[str],
+    rate: Union[int, float],
     binary: bool,
     add_crlf: Optional[bool],
     cmd_b: str,
@@ -617,17 +881,28 @@ def _query_obsv_rate(
     check_complete: Any,
     result_key: str,
 ) -> Dict[str, Any]:
-    """Общий раннер для OBSVM/OBSVH (команда с портом и rate)."""
-    command = f"{cmd_b} {port} {rate}" if binary else f"{cmd_a} {port} {rate}"
+    """Общий раннер для OBSVM/OBSVH (команда с портом и rate).
+
+    Если port пустой/None — в команду не подставляется COM (как UNLOG без порта, AGRICA без порта):
+    вывод идёт на «текущий» порт сессии, без явного COM1/COM2/COM3.
+    """
+    p = (port or "").strip()
+    rw = format_log_period_wire(float(rate))
+    if p:
+        command = f"{cmd_b} {p} {rw}" if binary else f"{cmd_a} {p} {rw}"
+    else:
+        command = f"{cmd_b} {rw}" if binary else f"{cmd_a} {rw}"
     return _run_data_query(
         core,
         command=command,
         parse_func=parse_func,
         binary=binary,
         add_crlf=add_crlf,
-        wait_time=1.0,
-        read_attempts=25,
-        read_timeout=2.5,
+        wait_time=0.0,
+        read_attempts=40,
+        first_read_timeout=0.38,
+        read_timeout=0.14,
+        max_wait=12.0,
         check_complete=check_complete,
         result_key=result_key,
     )
@@ -635,8 +910,8 @@ def _query_obsv_rate(
 
 def query_obsvm(
     core: Um982Core,
-    port: str = "COM1",
-    rate: int = 1,
+    port: Optional[str] = None,
+    rate: Union[int, float] = 1,
     binary: bool = False,
     add_crlf: Optional[bool] = None,
 ) -> Dict[str, Any]:
@@ -649,8 +924,8 @@ def query_obsvm(
 
 def query_obsvh(
     core: Um982Core,
-    port: str = "COM1",
-    rate: int = 1,
+    port: Optional[str] = None,
+    rate: Union[int, float] = 1,
     binary: bool = False,
     add_crlf: Optional[bool] = None,
 ) -> Dict[str, Any]:
@@ -663,61 +938,31 @@ def query_obsvh(
 
 def query_obsvmcmp(
     core: Um982Core,
-    port: str = "COM1",
-    rate: int = 1,
+    port: Optional[str] = None,
+    rate: Union[int, float] = 1,
     binary: bool = False,
     add_crlf: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    if add_crlf is None:
-        add_crlf = core.baudrate >= 460800
-
-    if core.serial_conn and core.serial_conn.in_waiting > 0:
-        core.serial_conn.reset_input_buffer()
-
-    command = f"OBSVMCMPB {port} {rate}" if binary else f"OBSVMCMPA {port} {rate}"
-    if not core.send_ascii_command(command, add_crlf=add_crlf):
-        return {"error": f"Не удалось отправить команду {command}"}
-
-    time.sleep(1.0)
-
-    response = b""
-    for _ in range(20):
-        time.sleep(0.5)
-        chunk = core.read_response(timeout=2.0)
-        if chunk:
-            response += chunk
-        elif response:
-            if binary:
-                for i in range(len(response) - 24):
-                    if response[i] == 0xAA and response[i + 1] == 0x44 and response[i + 2] == 0xB5:
-                        header = parse_unicore_header(response[i : i + 24])
-                        if header and header.message_id == OBSVMCMP_MESSAGE_ID:
-                            if len(response) >= i + 28:
-                                obs_num = struct.unpack("<I", response[i + 24 : i + 28])[0]
-                                if obs_num > 0:
-                                    break
-            else:
-                try:
-                    text = response.decode("ascii", errors="ignore")
-                    if "#OBSVMCMPA" in text:
-                        break
-                except Exception:
-                    pass
-            if len(response) > 5000:
-                break
-
-    if not response:
-        return {"error": "Ответ не получен"}
-
-    parsed = core.parse_binary_response(response)
-    obsvmcmp_data = _parse_obsvmcmp_message(response, binary)
-
-    return {
-        "command": command,
-        "response": parsed,
-        "obsvmcmp": obsvmcmp_data,
-        "raw_response_length": len(response),
-    }
+    p = (port or "").strip()
+    rw = format_log_period_wire(float(rate))
+    if p:
+        command = f"OBSVMCMPB {p} {rw}" if binary else f"OBSVMCMPA {p} {rw}"
+    else:
+        command = f"OBSVMCMPB {rw}" if binary else f"OBSVMCMPA {rw}"
+    return _run_data_query(
+        core,
+        command=command,
+        parse_func=_parse_obsvmcmp_message,
+        binary=binary,
+        add_crlf=add_crlf,
+        wait_time=0.0,
+        read_attempts=48,
+        first_read_timeout=0.38,
+        read_timeout=0.14,
+        max_wait=12.0,
+        check_complete=_check_obsvmcmp_complete,
+        result_key="obsvmcmp",
+    )
 
 
 # Типы для потокового чтения: (cmd_b, cmd_a, message_id, ascii_marker)
@@ -731,8 +976,8 @@ _STREAM_CONFIG = {
 def send_obsv_stream_command(
     core: Um982Core,
     stream_type: str,
-    port: str = "COM1",
-    rate: int = 1,
+    port: Optional[str] = None,
+    rate: Union[int, float] = 1,
     binary: bool = False,
     add_crlf: Optional[bool] = None,
 ) -> bool:
@@ -742,10 +987,43 @@ def send_obsv_stream_command(
     if add_crlf is None:
         add_crlf = core.baudrate >= 460800
     cmd_b, cmd_a, _mid, _marker = _STREAM_CONFIG[stream_type]
-    command = f"{cmd_b} {port} {rate}" if binary else f"{cmd_a} {port} {rate}"
+    p = (port or "").strip()
+    rw = format_log_period_wire(float(rate))
+    if p:
+        command = f"{cmd_b} {p} {rw}" if binary else f"{cmd_a} {p} {rw}"
+    else:
+        command = f"{cmd_b} {rw}" if binary else f"{cmd_a} {rw}"
     if core.serial_conn and core.serial_conn.in_waiting > 0:
         core.serial_conn.reset_input_buffer()
     return bool(core.send_ascii_command(command, add_crlf=add_crlf))
+
+
+def _obsv_binary_frame_length_candidates(
+    buffer: bytes,
+    offset: int,
+    *,
+    rec_bytes: int,
+    header_ml: int,
+) -> List[int]:
+    """Длины полного бинарного кадра OBSV* от sync (учитываем битые message_length и 0 наблюдений)."""
+    seen: set[int] = set()
+    out: List[int] = []
+    for L in (header_ml, header_ml + 4, header_ml - 4):
+        if L >= 28 and L not in seen:
+            seen.add(L)
+            out.append(L)
+    if len(buffer) >= offset + 28:
+        try:
+            obs_n = struct.unpack("<I", buffer[offset + 24 : offset + 28])[0]
+        except Exception:
+            obs_n = None
+        if obs_n is not None and obs_n <= 2048:
+            computed = 24 + 4 + rec_bytes * obs_n + 4
+            for L in (computed, computed - 4):
+                if L >= 28 and L not in seen:
+                    seen.add(L)
+                    out.append(L)
+    return out
 
 
 def extract_one_obsv_message(
@@ -777,15 +1055,32 @@ def extract_one_obsv_message(
         offset, header = found
         if header.message_id != message_id:
             return None, buffer
-        msg_len = header.message_length
-        if msg_len <= 0 or len(buffer) < offset + msg_len:
-            return None, buffer
-        slice_msg = buffer[offset : offset + msg_len]
-        parsed = parse_func(slice_msg, True)
-        if parsed is None:
-            return None, buffer
-        return parsed, buffer[offset + msg_len :]
+        rec_sz = 24 if stream_type == "obsvmcmp" else 40
+        ml = int(header.message_length)
+        want_lens = _obsv_binary_frame_length_candidates(buffer, offset, rec_bytes=rec_sz, header_ml=ml)
+        for msg_len in want_lens:
+            if msg_len < 28:
+                continue
+            if len(buffer) < offset + msg_len:
+                continue
+            slice_msg = buffer[offset : offset + msg_len]
+            parsed = parse_func(slice_msg, True)
+            if parsed is not None:
+                return parsed, buffer[offset + msg_len :]
+        return None, buffer
     else:
+        if stream_type == "obsvmcmp":
+            m = OBSVMCMP_ASCII_MESSAGE_RE.search(buffer)
+            if not m:
+                return None, buffer
+            frag = m.group(0)
+            parsed = parse_func(frag, False)
+            if parsed is None:
+                return None, buffer
+            end = m.end()
+            while end < len(buffer) and buffer[end] in (13, 10):
+                end += 1
+            return parsed, buffer[end:]
         pos = buffer.find(ascii_marker)
         if pos < 0:
             return None, buffer
@@ -803,7 +1098,7 @@ def extract_one_obsv_message(
 
 def query_obsvbase(
     core: Um982Core,
-    port: str = "COM1",
+    port: Optional[str] = None,
     trigger: str = "ONCHANGED",
     binary: bool = False,
     add_crlf: Optional[bool] = None,
@@ -811,23 +1106,37 @@ def query_obsvbase(
     if trigger.upper() != "ONCHANGED":
         return {"error": f"Invalid trigger: {trigger}. Only 'ONCHANGED' is supported for OBSVBASE"}
 
-    command = f"OBSVBASEB {port} {trigger.upper()}" if binary else f"OBSVBASEA {port} {trigger.upper()}"
-    # OBSVBASE с ONCHANGED может отвечать с задержкой — даём больше времени и попыток чтения
+    tr = trigger.upper()
+    p = (port or "").strip()
+    if p:
+        command = f"OBSVBASEB {p} {tr}" if binary else f"OBSVBASEA {p} {tr}"
+    else:
+        command = f"OBSVBASEB {tr}" if binary else f"OBSVBASEA {tr}"
     return _run_data_query(
         core,
         command=command,
         parse_func=_parse_obsvbase_message,
         binary=binary,
         add_crlf=add_crlf,
-        wait_time=1.5,
-        read_attempts=35,
-        read_timeout=2.5,
+        wait_time=0.0,
+        read_attempts=48,
+        first_read_timeout=0.38,
+        read_timeout=0.14,
+        max_wait=12.0,
         check_complete=_check_obsvbase_complete,
         result_key="obsvbase",
     )
 
 
+# --- OBSVMCMP: assumptions and example ---
+#
+# Assumptions (per doc):
+# - Bit order: bit 0 = LSB of first byte (little-endian bit numbering).
+# - Multi-byte fields: same byte order as in buffer (LE).
+# - Doppler (28 bits) and ADR (32 bits) are sign-extended when top bit is set.
+
 if __name__ == "__main__":
+    # Unit test: decode one 24-byte record (all zeros except prn=6, cn0_index=5 -> 25 dB-Hz)
     _r = bytes(24)
     _r = bytearray(_r)
     _r[17] = 6

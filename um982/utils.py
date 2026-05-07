@@ -1,7 +1,8 @@
+import math
 import re
 import struct
 from dataclasses import asdict
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 
 from .models import UnicoreHeader, NMEAMessage, ParsedResponse
 
@@ -47,7 +48,12 @@ def parse_unicore_header(header_bytes: bytes) -> Optional[UnicoreHeader]:
 
 
 def parse_nmea_messages(text: str) -> List[NMEAMessage]:
-    """Парсинг NMEA-подобных сообщений из текста (может быть смешано с бинарными данными)."""
+    """
+    Разбор ASCII-строк с префиксом «$» из текста ответа приёмника (Unicore ASCII: CONFIG, COMMAND, …).
+
+    Протокол NMEA описан в мануале Unicore отдельно (п. 7.1–7.2); строки CONFIG и прочие настройки
+    относятся к ASCII-формату протокола Unicore, а не к NMEA. Имя функции сохранено для совместимости.
+    """
     messages: List[NMEAMessage] = []
 
     nmea_pattern = r"\$[A-Z][A-Z0-9]{2,}[^$\r\n]*"
@@ -103,6 +109,7 @@ def parse_response(data: bytes) -> ParsedResponse:
         length=len(data),
     )
 
+    # Попытка распарсить как ASCII-текст (предложения с «$»: Unicore ASCII, при необходимости и NMEA по гл. 7)
     try:
         text = data.decode("ascii", errors="ignore")
         nmea_messages = parse_nmea_messages(text)
@@ -112,10 +119,11 @@ def parse_response(data: bytes) -> ParsedResponse:
             if len(data) > len(text.encode("ascii", errors="ignore")):
                 result.extra["type"] = "mixed"
             else:
-                result.extra["type"] = "NMEA"
+                result.extra["type"] = "ASCII"
     except Exception as e:
         result.extra["decode_error"] = str(e)
 
+    # Попытка парсинга как протокол Unicore binary
     if len(data) >= 24:
         header = parse_unicore_header(data[:24])
         if header is not None:
@@ -124,7 +132,7 @@ def parse_response(data: bytes) -> ParsedResponse:
             msg_length = header.message_length
             if len(data) >= msg_length:
                 data_start = 24
-                data_end = msg_length - 4
+                data_end = msg_length - 4  # исключаем CRC
                 crc_start = msg_length - 4
                 crc_end = msg_length
 
@@ -140,6 +148,7 @@ def parse_response(data: bytes) -> ParsedResponse:
                     "value": crc_value,
                 }
 
+    # Резервный вариант: общий бинарный парсинг
     if "unicore_data" not in result.extra and len(data) >= 2:
         result.extra["binary"] = {
             "header": data[:2].hex(),
@@ -174,10 +183,49 @@ def parsed_response_to_legacy_dict(parsed: ParsedResponse) -> Dict[str, Any]:
         if "unicore_crc" in parsed.extra:
             result["parsed"]["unicore_binary"]["crc"] = parsed.extra["unicore_crc"]
 
+    # Прочие дополнительные поля переносим как есть
     for key, value in parsed.extra.items():
         if key not in {"type", "nmea_count", "unicore_data", "unicore_crc"}:
             result["parsed"][key] = value
 
     return result
+
+
+def parse_log_period_str(value: Union[str, int, float, None]) -> float:
+    """
+    Период выдачи LOG / query (эпохи): неотрицательное число; в строке допускается «,» как разделитель.
+    """
+    if value is None:
+        raise ValueError("period is None")
+    if isinstance(value, (int, float)):
+        v = float(value)
+        if not math.isfinite(v) or v < 0 or v > 1e6:
+            raise ValueError("period out of range")
+        return v
+    t = str(value).strip().replace(",", ".")
+    if not t:
+        raise ValueError("period empty")
+    v = float(t)
+    if not math.isfinite(v) or v < 0 or v > 1e6:
+        raise ValueError("period out of range")
+    return v
+
+
+def format_log_period_wire(x: float) -> str:
+    """Токен периода для ASCII-команды «MSG … period»."""
+    if not math.isfinite(x) or x < 0:
+        raise ValueError("invalid period for wire")
+    if abs(x - round(x)) < 1e-9:
+        return str(int(round(x)))
+    return format(x, "g")
+
+
+def format_log_period_display(x: float) -> str:
+    """Отображение периода в полях GUI."""
+    if not math.isfinite(x):
+        return "1"
+    if abs(x - round(x)) < 1e-9:
+        return str(int(round(x)))
+    return format(x, "g")
 
 

@@ -1,3 +1,4 @@
+"""Общие утилиты data output: _run_data_query, _make_unicore_header_checker, поиск заголовка Unicore и маркеров."""
 import time
 from typing import Callable, Dict, Any, Optional, Tuple
 
@@ -5,6 +6,7 @@ from um982.core import Um982Core
 from um982.utils import parse_unicore_header
 
 
+# Синхрослово Unicore (3 байта)
 UNICORE_SYNC = bytes((0xAA, 0x44, 0xB5))
 
 
@@ -28,7 +30,7 @@ def find_ascii_marker(data: bytes, marker: bytes) -> int:
 
 
 def find_nmea_marker(data: bytes) -> int:
-    """Позиция первого символа NMEA ('$') в data, -1 если не найден."""
+    """Позиция первого символа «$» (начало ASCII-строки в потоке Unicore; не смешивать с отдельным протоколом NMEA)."""
     pos = data.find(b"$")
     return pos if pos >= 0 else -1
 
@@ -40,13 +42,21 @@ def _run_data_query(
     parse_func: Callable[[bytes, bool], Optional[dict]],
     binary: bool = False,
     add_crlf: Optional[bool] = None,
-    wait_time: float = 0.5,
-    read_attempts: int = 10,
-    read_timeout: float = 1.5,
+    wait_time: float = 0.0,
+    read_attempts: int = 48,
+    first_read_timeout: float = 0.32,
+    read_timeout: float = 0.14,
+    max_wait: float = 10.0,
     check_complete: Optional[Callable[[bytes, bool], bool]] = None,
     result_key: str = "data",
 ) -> Dict[str, Any]:
-    """Общий helper для запросов потоковых данных (query_*)."""
+    """Общий helper для запросов потоковых данных (query_*).
+
+    Без фиксированной многосекундной паузы до чтения: первое чтение с чуть большим
+    окном (first_read_timeout) — чтобы пойти первый байт ответа без лишних циклов;
+    дальше короткие read_response до check_complete. Устаревший wait_time>0 —
+    совместимость (один sleep перед циклом).
+    """
     if add_crlf is None:
         add_crlf = core.baudrate >= 460800
 
@@ -56,20 +66,26 @@ def _run_data_query(
     if not core.send_ascii_command(command, add_crlf=add_crlf):
         return {"error": f"Failed to send {command} command"}
 
-    time.sleep(wait_time)
+    if wait_time > 0:
+        time.sleep(wait_time)
 
     response = b""
-    for _ in range(read_attempts):
-        time.sleep(0.2)
-        chunk = core.read_response(timeout=read_timeout)
+    deadline = time.monotonic() + max_wait
+    for attempt in range(read_attempts):
+        if time.monotonic() >= deadline:
+            break
+        rt = first_read_timeout if attempt == 0 else read_timeout
+        chunk = core.read_response(timeout=rt)
         if chunk:
             response += chunk
             if check_complete and check_complete(response, binary):
                 break
+            if not check_complete and len(response) > 100:
+                break
         elif response:
             if check_complete and check_complete(response, binary):
                 break
-            if len(response) > 100:
+            if not check_complete and len(response) > 100:
                 break
         if len(response) > 50000:
             break
@@ -119,12 +135,31 @@ def _make_unicore_header_checker(
         if ascii_tag:
             try:
                 text = data.decode("ascii", errors="ignore")
-                pos = text.find(ascii_tag.decode("ascii"))
-                if pos >= 0:
+                tag = ascii_tag.decode("ascii")
+                pos = text.find(tag)
+                if pos >= 0 and text.startswith(tag, pos):
                     end_pos = min(len(text), pos + ascii_window)
-                    if "*" in text[pos:end_pos]:
-                        semicolon_pos = text.find(";", pos)
-                        if semicolon_pos > pos and semicolon_pos < end_pos:
+                    payload_start = pos + len(tag)
+                    # Первый '*' в окне может относиться к другой строке (#OTHER;...*).
+                    # Берём первую '*' такую, что между концом тега и '*' нет нового '#'.
+                    star = -1
+                    search_from = pos
+                    while search_from < end_pos:
+                        cand = text.find("*", search_from, end_pos)
+                        if cand < 0:
+                            break
+                        if text.find("#", payload_start, cand) < 0:
+                            star = cand
+                            break
+                        search_from = cand + 1
+                    if star > pos:
+                        frame = text[pos:star]
+                        if ";" in frame:
+                            return True
+                        j = payload_start
+                        while j < star and text[j] in " \t":
+                            j += 1
+                        if j < star and text[j] in ",;":
                             return True
             except Exception:
                 pass

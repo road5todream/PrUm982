@@ -25,9 +25,9 @@ from .nav import (
     query_adrnavh,
     query_sppnavh,
     query_stadop,
-    query_arddop,
+    query_adrdop,
     query_bestnavxyz,
-    query_arddoph,
+    query_adrdoph,
 )
 from .pvt import query_pvtsln
 from .logging import query_uniloglist, log, unlog
@@ -56,9 +56,9 @@ __all__ = [
     "query_adrnavh",
     "query_sppnavh",
     "query_stadop",
-    "query_arddop",
+    "query_adrdop",
     "query_bestnavxyz",
-    "query_arddoph",
+    "query_adrdoph",
     "query_pvtsln",
     "query_uniloglist",
     "IonosphereModel",

@@ -9,12 +9,21 @@ from um982.utils import parse_unicore_header
 
 from .base import _run_data_query, _make_unicore_header_checker
 
+# §7.3.12 GPSUTC binary: после 24-байтного заголовка Unicore — поля utc_wn…reserved (48 байт) + CRC32 (4 байта).
+_GPSUTC_BINARY_AFTER_HEADER = 52
+# §7.3.13 BD3UTC binary: поля utc_wn…два reserved (56 байт) + CRC32 (4 байта).
+_BD3UTC_BINARY_AFTER_HEADER = 60
+
 
 # --- Общая модель параметров смещения UTC ---
 
 @dataclass
 class UtcOffsetParams:
-    """Унифицированные параметры перевода системного времени в UTC (GPS или BDS-3)."""
+    """
+    Унифицированные параметры перевода системного времени в UTC (GPS или BDS-3).
+    Общие поля: utc_wn, tot, A0, A1, wn_lsf, dn, delta_ls, delta_lsf.
+    GPS: delta_utc; BD3: A2, reserved2.
+    """
     system: str  # "GPS" | "BD3"
     utc_wn: int = 0
     tot: int = 0
@@ -89,14 +98,46 @@ class UtcOffsetParams:
         )
 
 
-def _utc_complete_checker(message_id: int, ascii_marker: bytes):
+def _utc_complete_checker(message_id: int, ascii_marker: bytes, *, binary_min_total: int = 80):
     return _make_unicore_header_checker(
         message_id,
         ascii_tag=ascii_marker,
         ascii_window=500,
-        binary_min_total=80,
+        binary_min_total=binary_min_total,
         ascii_min_total=50,
     )
+
+
+def _utc_ascii_csv_fields(s: str) -> list[str]:
+    """Поля через запятую; переносы строк внутри сообщения (как в мануале) убираем."""
+    flat = re.sub(r"[\r\n]+", "", s)
+    return [f.strip() for f in flat.split(",") if f.strip() != ""]
+
+
+def _utc_ascii_payload_fields(line_nc: str, tag: str) -> list[str]:
+    """
+    Поля полезной нагрузки после тега (#GPSUTCA / #BD3UTCA).
+    Форматы: только запятые; либо «заголовок,…,;поле,…» как в разд. 7.3.12 / 7.3.13 (ASCII).
+    """
+    t = tag.upper()
+    if not line_nc.strip().upper().startswith(t):
+        return []
+    if ";" in line_nc:
+        prefix, body = line_nc.split(";", 1)
+        if not prefix.strip().upper().startswith(t):
+            return []
+        body_f = _utc_ascii_csv_fields(body)
+        header_tail = prefix[len(tag) :].lstrip(",").strip()
+        if not header_tail:
+            return body_f
+        if len(body_f) >= 10 and tag.upper() == "#GPSUTCA":
+            return body_f
+        # BD3UTC: в примере мануала после «;» часто 9 полей (без двух reserved в ASCII).
+        if len(body_f) >= 9 and tag.upper() == "#BD3UTCA":
+            return body_f
+        return _utc_ascii_csv_fields(header_tail) + body_f
+    rest = line_nc[len(tag) :].lstrip(",").strip()
+    return _utc_ascii_csv_fields(rest)
 
 
 # --- Парсеры ---
@@ -106,38 +147,40 @@ def _parse_gpsutc_message(data: bytes, binary: bool = False) -> Optional[dict]:
     if binary:
         if len(data) < 24:
             return None
-        payload_len = 48
-        for i in range(len(data) - 24):
+        need = 24 + _GPSUTC_BINARY_AFTER_HEADER
+        for i in range(len(data) - need + 1):
             if data[i] == 0xAA and data[i + 1] == 0x44 and data[i + 2] == 0xB5:
                 header = parse_unicore_header(data[i : i + 24])
                 if not header or header.message_id != 19:
                     continue
                 offset = i + 24
-                if len(data) < offset + payload_len:
+                if len(data) < offset + _GPSUTC_BINARY_AFTER_HEADER:
                     continue
 
                 utc_wn = struct.unpack("<I", data[offset : offset + 4])[0]
-                offset += 4
-                tot = struct.unpack("<I", data[offset : offset + 4])[0]
-                offset += 4
-                a0 = struct.unpack("<d", data[offset : offset + 8])[0]
-                offset += 8
-                a1 = struct.unpack("<d", data[offset : offset + 8])[0]
-                offset += 8
-                wn_lsf = struct.unpack("<I", data[offset : offset + 4])[0]
-                offset += 4
-                dn = struct.unpack("<I", data[offset : offset + 4])[0]
-                offset += 4
-                delta_ls = struct.unpack("<i", data[offset : offset + 4])[0]
-                offset += 4
-                delta_lsf = struct.unpack("<i", data[offset : offset + 4])[0]
-                offset += 4
-                delta_utc = struct.unpack("<I", data[offset : offset + 4])[0]
-                offset += 4
-                reserved = struct.unpack("<I", data[offset : offset + 4])[0]
+                p = offset + 4
+                tot = struct.unpack("<I", data[p : p + 4])[0]
+                p += 4
+                a0 = struct.unpack("<d", data[p : p + 8])[0]
+                p += 8
+                a1 = struct.unpack("<d", data[p : p + 8])[0]
+                p += 8
+                wn_lsf = struct.unpack("<I", data[p : p + 4])[0]
+                p += 4
+                dn = struct.unpack("<I", data[p : p + 4])[0]
+                p += 4
+                delta_ls = struct.unpack("<i", data[p : p + 4])[0]
+                p += 4
+                delta_lsf = struct.unpack("<i", data[p : p + 4])[0]
+                p += 4
+                delta_utc = struct.unpack("<I", data[p : p + 4])[0]
+                p += 4
+                reserved = struct.unpack("<I", data[p : p + 4])[0]
+                p += 4
+                crc_wire = struct.unpack("<I", data[p : p + 4])[0]
 
                 msg_length = header.message_length
-                crc_value = None
+                crc_value = crc_wire
                 if msg_length > 0 and len(data) >= i + msg_length:
                     crc_value = struct.unpack("<I", data[i + msg_length - 4 : i + msg_length])[0]
 
@@ -176,8 +219,8 @@ def _parse_gpsutc_message(data: bytes, binary: bool = False) -> Optional[dict]:
             idx = line.find("*")
             if idx < 0:
                 continue
-            data_part_clean = line[:idx].replace("#GPSUTCA", "").strip()
-            fields = [f.strip() for f in re.split(r"[,\r\n]+", data_part_clean) if f.strip()]
+            line_nc = line[:idx].strip()
+            fields = _utc_ascii_payload_fields(line_nc, "#GPSUTCA")
             if len(fields) < 10:
                 continue
 
@@ -224,40 +267,42 @@ def _parse_bd3utc_message(data: bytes, binary: bool = False) -> Optional[dict]:
     if binary:
         if len(data) < 24:
             return None
-        payload_len = 56
-        for i in range(len(data) - 24):
+        need = 24 + _BD3UTC_BINARY_AFTER_HEADER
+        for i in range(len(data) - need + 1):
             if data[i] == 0xAA and data[i + 1] == 0x44 and data[i + 2] == 0xB5:
                 header = parse_unicore_header(data[i : i + 24])
                 if not header or header.message_id != 22:
                     continue
                 offset = i + 24
-                if len(data) < offset + payload_len:
+                if len(data) < offset + _BD3UTC_BINARY_AFTER_HEADER:
                     continue
 
                 utc_wn = struct.unpack("<I", data[offset : offset + 4])[0]
-                offset += 4
-                tot = struct.unpack("<I", data[offset : offset + 4])[0]
-                offset += 4
-                a0 = struct.unpack("<d", data[offset : offset + 8])[0]
-                offset += 8
-                a1 = struct.unpack("<d", data[offset : offset + 8])[0]
-                offset += 8
-                a2 = struct.unpack("<d", data[offset : offset + 8])[0]
-                offset += 8
-                wn_lsf = struct.unpack("<I", data[offset : offset + 4])[0]
-                offset += 4
-                dn = struct.unpack("<I", data[offset : offset + 4])[0]
-                offset += 4
-                delta_ls = struct.unpack("<i", data[offset : offset + 4])[0]
-                offset += 4
-                delta_lsf = struct.unpack("<i", data[offset : offset + 4])[0]
-                offset += 4
-                reserved1 = struct.unpack("<I", data[offset : offset + 4])[0]
-                offset += 4
-                reserved2 = struct.unpack("<I", data[offset : offset + 4])[0]
+                p = offset + 4
+                tot = struct.unpack("<I", data[p : p + 4])[0]
+                p += 4
+                a0 = struct.unpack("<d", data[p : p + 8])[0]
+                p += 8
+                a1 = struct.unpack("<d", data[p : p + 8])[0]
+                p += 8
+                a2 = struct.unpack("<d", data[p : p + 8])[0]
+                p += 8
+                wn_lsf = struct.unpack("<I", data[p : p + 4])[0]
+                p += 4
+                dn = struct.unpack("<I", data[p : p + 4])[0]
+                p += 4
+                delta_ls = struct.unpack("<i", data[p : p + 4])[0]
+                p += 4
+                delta_lsf = struct.unpack("<i", data[p : p + 4])[0]
+                p += 4
+                reserved1 = struct.unpack("<I", data[p : p + 4])[0]
+                p += 4
+                reserved2 = struct.unpack("<I", data[p : p + 4])[0]
+                p += 4
+                crc_wire = struct.unpack("<I", data[p : p + 4])[0]
 
                 msg_length = header.message_length
-                crc_value = None
+                crc_value = crc_wire
                 if msg_length > 0 and len(data) >= i + msg_length:
                     crc_value = struct.unpack("<I", data[i + msg_length - 4 : i + msg_length])[0]
 
@@ -297,20 +342,22 @@ def _parse_bd3utc_message(data: bytes, binary: bool = False) -> Optional[dict]:
             idx = line.find("*")
             if idx < 0:
                 continue
-            data_part_clean = line[:idx].replace("#BD3UTCA", "").strip()
-            fields = [f.strip() for f in re.split(r"[,\r\n]+", data_part_clean) if f.strip()]
-            if len(fields) < 10:
+            line_nc = line[:idx].strip()
+            fields = _utc_ascii_payload_fields(line_nc, "#BD3UTCA")
+            if len(fields) < 9:
                 continue
 
             if len(fields) >= 20:
                 data_fields = fields[9:20]
             elif len(fields) >= 11:
+                # 19 полей без «;» в старых примерах — последние 11 (не [9:19]).
                 data_fields = fields[-11:]
             else:
-                data_fields = fields[-10:] + ["0"]
+                data_fields = list(fields)
 
-            if len(data_fields) < 10:
-                continue
+            while len(data_fields) < 11:
+                data_fields.append("0")
+            data_fields = data_fields[:11]
 
             utc_wn = int(data_fields[0])
             tot = int(data_fields[1])
@@ -322,7 +369,7 @@ def _parse_bd3utc_message(data: bytes, binary: bool = False) -> Optional[dict]:
             delta_ls = int(data_fields[7])
             delta_lsf = int(data_fields[8])
             reserved1 = int(data_fields[9])
-            reserved2 = int(data_fields[10]) if len(data_fields) > 10 else 0
+            reserved2 = int(data_fields[10])
 
             return {
                 "format": "ascii",
@@ -359,7 +406,7 @@ def query_gpsutc(
     else:
         command = f"GPSUTCB {rate}" if binary else f"GPSUTCA {rate}"
 
-    check_complete = _utc_complete_checker(19, b"#GPSUTCA")
+    check_complete = _utc_complete_checker(19, b"#GPSUTCA", binary_min_total=88)
 
     return _run_data_query(
         core,
@@ -367,9 +414,7 @@ def query_gpsutc(
         parse_func=_parse_gpsutc_message,
         binary=binary,
         add_crlf=add_crlf,
-        wait_time=0.5,
-        read_attempts=10,
-        read_timeout=1.5,
+        read_attempts=24,
         check_complete=check_complete,
         result_key="gpsutc",
     )
@@ -387,7 +432,7 @@ def query_bd3utc(
     else:
         command = f"BD3UTCB {rate}" if binary else f"BD3UTCA {rate}"
 
-    check_complete = _utc_complete_checker(22, b"#BD3UTCA")
+    check_complete = _utc_complete_checker(22, b"#BD3UTCA", binary_min_total=100)
 
     return _run_data_query(
         core,
@@ -395,9 +440,7 @@ def query_bd3utc(
         parse_func=_parse_bd3utc_message,
         binary=binary,
         add_crlf=add_crlf,
-        wait_time=0.5,
-        read_attempts=10,
-        read_timeout=1.5,
+        read_attempts=24,
         check_complete=check_complete,
         result_key="bd3utc",
     )

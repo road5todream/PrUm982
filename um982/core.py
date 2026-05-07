@@ -82,13 +82,14 @@ class Um982Core:
         if self.serial_conn and self.serial_conn.is_open:
             self.serial_conn.close()
 
-    def send_ascii_command(self, command: str, add_crlf: bool = True) -> bool:
+    def send_ascii_command(self, command: str, add_crlf: Optional[bool] = True) -> bool:
         if not self.serial_conn or not self.serial_conn.is_open:
             print("Последовательное соединение не открыто")
             return False
 
         try:
-            if add_crlf and not command.endswith("\r\n"):
+            use_crlf = self.baudrate >= 460800 if add_crlf is None else bool(add_crlf)
+            if use_crlf and not command.endswith("\r\n"):
                 if not command.endswith("\r"):
                     command = command + "\r\n"
             raw = command.encode("ascii")
@@ -141,7 +142,7 @@ class Um982Core:
                 if not response:
                     time.sleep(0.01)
                 else:
-                    time.sleep(0.05)
+                    time.sleep(0.02)
                     if self.serial_conn.in_waiting == 0:
                         break
 
@@ -191,6 +192,8 @@ class Um982Core:
             return lines
         finally:
             self.serial_conn.timeout = old_timeout
+
+    # --- Высокоуровневый парсинг ---
 
     def parse_binary_response(self, data: bytes):
         """Совместимая с прежним API обёртка вокруг нового парсера."""

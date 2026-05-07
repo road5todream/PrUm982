@@ -2,28 +2,34 @@
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from um982.core import Um982Core
-from um982.utils import parse_unicore_header
+from um982.utils import format_log_period_wire, parse_log_period_str, parse_unicore_header
 
 from .base import _run_data_query, _make_unicore_header_checker
 
+
+# --- Единая модель ионосферы и конвертеры ---
 
 @dataclass
 class IonosphereModel:
     """
     Унифицированное представление параметров ионосферы любой системы.
+    alpha — коэффициенты Клонбуха (секунды, 3 или 4 или 9 в зависимости от системы);
+    beta — коэффициенты (секунды), только GPS/BDS;
+    sf — масштабные множители (5 байт/значений), только Galileo;
+    a — альтернативное имя для alpha (a1..a9), BD3.
     """
     system: str  # "GPS" | "GAL" | "BDS" | "BD3"
-    alpha: Dict[str, float] = field(default_factory=dict)  # a0,a1,a2,a3
+    alpha: Dict[str, float] = field(default_factory=dict)  # a0,a1,a2,a3 или a1..a9
     beta: Optional[Dict[str, float]] = None   # b0..b3 для GPS/BDS
     sf: Optional[Dict[str, int]] = None      # sf1..sf5 для Galileo
     us_svid: Optional[int] = None
     us_week: Optional[int] = None
     ul_sec: Optional[int] = None
     reserved: Optional[int] = None
-    format: str = "ascii"
+    format: str = "ascii"  # "ascii" | "binary"
     raw: Optional[str] = None
     header: Optional[Dict[str, Any]] = None
     crc: Optional[str] = None
@@ -89,13 +95,40 @@ class IonosphereModel:
         )
 
 
+def _ionosphere_log_wire_command(
+    stem: str,
+    *,
+    binary: bool,
+    rate: Optional[Union[int, float]],
+    trigger: Optional[str],
+) -> str:
+    """
+    Строка LOG-запроса ионосферы на провод (§7.3.x): «STEMB|A», «STEMB 1», «STEMB ONCHANGED».
+    Без периода (rate is None и не ONCHANGED) — только имя сообщения, как одиночный запрос без частоты.
+    """
+    s = stem.strip().upper()
+    suf = "B" if binary else "A"
+    if trigger and trigger.upper() == "ONCHANGED":
+        return f"{s}{suf} ONCHANGED"
+    if rate is None:
+        return f"{s}{suf}"
+    try:
+        rf = parse_log_period_str(rate)
+        if rf <= 0:
+            return f"{s}{suf}"
+    except ValueError:
+        return f"{s}{suf}"
+    return f"{s}{suf} {format_log_period_wire(rf)}"
+
+
 def _ionosphere_complete_checker(message_id: int, ascii_marker: bytes) -> Any:
     """Checker для ионосферных сообщений (binary по message_id, ASCII по маркеру)."""
     return _make_unicore_header_checker(
         message_id,
         ascii_tag=ascii_marker,
         ascii_window=500,
-        binary_min_total=80,
+        # Fallback «достаточно байт»: строго > порога (см. common._make_unicore_header_checker). 71 — типичный BD3ION ~72 B.
+        binary_min_total=71,
         ascii_min_total=50,
     )
 
@@ -382,7 +415,14 @@ def _parse_bdsion_message(data: bytes, binary: bool = False) -> Optional[dict]:
 
 
 def _parse_bd3ion_message(data: bytes, binary: bool = False) -> Optional[dict]:
-    """Парсинг ответа BD3ION (ионосферные параметры BDS-3). При запросе binary при неудаче пробует ASCII."""
+    """
+    Парсинг ответа BD3ION (ионосферные параметры BDS-3, §7.3.9).
+    Формат кадра тот же после запроса «BD3IONB 1», «BD3IONB ONCHANGED» или «BD3IONB» без периода.
+    При binary при неудаче пробует ASCII (#BD3IONA).
+    """
+    # Бинарное тело (разд. 7.3.9): 9×FLOAT + 4 зарезервированных байта + ULONG + CRC в конце кадра.
+    _bd3_payload_after_header = 9 * 4 + 4 + 4
+
     if binary:
         if len(data) >= 24:
             for i in range(len(data) - 24):
@@ -391,12 +431,11 @@ def _parse_bd3ion_message(data: bytes, binary: bool = False) -> Optional[dict]:
                     if header and header.message_id != 21:
                         continue
                     offset = i + 24
-                    if len(data) < offset + 9 * 8:
+                    if len(data) < offset + _bd3_payload_after_header:
                         continue
-                    a_vals = [struct.unpack("<d", data[offset + k * 8 : offset + (k + 1) * 8])[0] for k in range(9)]
-                    offset += 9 * 8
-                    if len(data) < offset + 4:
-                        continue
+                    a_vals = [struct.unpack("<f", data[offset + k * 4 : offset + (k + 1) * 4])[0] for k in range(9)]
+                    offset += 9 * 4
+                    offset += 4  # padding до ULONG reserved (оффсет H+40 в мануале)
                     reserved = struct.unpack("<I", data[offset : offset + 4])[0]
                     msg_length = header.message_length
                     crc_value = None
@@ -423,16 +462,37 @@ def _parse_bd3ion_message(data: bytes, binary: bool = False) -> Optional[dict]:
             line = match.group(0).strip()
             if not line:
                 continue
-            parts = line.split(";")
-            if len(parts) < 2:
+            line_nc = line.split("*", 1)[0].strip()
+            if not line_nc.upper().startswith("#BD3IONA"):
                 continue
-            data_part = parts[1]
-            data_part_clean = data_part.split("*")[0]
-            fields = [f for f in data_part_clean.split(",") if f != ""]
-            if len(fields) < 10:
+            a_vals: list[float]
+            reserved: int
+            if ";" in line_nc:
+                prefix, body = line_nc.split(";", 1)
+                if not prefix.strip().upper().startswith("#BD3IONA"):
+                    continue
+                body_fields = [f.strip() for f in body.split(",") if f.strip() != ""]
+                header_tail = prefix[len("#BD3IONA") :].lstrip(",").strip()
+                # #BD3IONA;… — всё после «;»; либо #BD3IONA,заголовок;коэффициенты (реальный вывод UM982).
+                if not header_tail:
+                    fields = body_fields
+                elif len(body_fields) >= 10:
+                    fields = body_fields
+                else:
+                    hdr_fields = [f.strip() for f in header_tail.split(",") if f.strip() != ""]
+                    fields = hdr_fields + body_fields
+            else:
+                body = line_nc[len("#BD3IONA") :].lstrip(",")
+                fields = [f.strip() for f in body.split(",") if f.strip() != ""]
+
+            if len(fields) >= 19:
+                a_vals = [float(fields[idx]) for idx in range(9, 18)]
+                reserved = int(float(fields[18]))
+            elif len(fields) == 10:
+                a_vals = [float(fields[idx]) for idx in range(9)]
+                reserved = int(float(fields[9]))
+            else:
                 continue
-            a_vals = [float(fields[idx]) for idx in range(9)]
-            reserved = int(fields[9])
             return {
                 "format": "ascii",
                 "a": {f"a{idx + 1}": v for idx, v in enumerate(a_vals)},
@@ -448,15 +508,12 @@ def _parse_bd3ion_message(data: bytes, binary: bool = False) -> Optional[dict]:
 
 def query_gpsion(
     core: Um982Core,
-    rate: int = 1,
+    rate: Union[int, float, None] = 1,
     trigger: Optional[str] = None,
     binary: bool = False,
     add_crlf: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    if trigger and trigger.upper() == "ONCHANGED":
-        command = "GPSIONB ONCHANGED" if binary else "GPSIONA ONCHANGED"
-    else:
-        command = f"GPSIONB {rate}" if binary else f"GPSIONA {rate}"
+    command = _ionosphere_log_wire_command("GPSION", binary=binary, rate=rate, trigger=trigger)
     check_complete = _ionosphere_complete_checker(8, b"#GPSIONA")
     return _run_data_query(
         core,
@@ -464,9 +521,7 @@ def query_gpsion(
         parse_func=_parse_gpsion_message,
         binary=binary,
         add_crlf=add_crlf,
-        wait_time=0.5,
-        read_attempts=10,
-        read_timeout=1.5,
+        read_attempts=24,
         check_complete=check_complete,
         result_key="gpsion",
     )
@@ -474,15 +529,12 @@ def query_gpsion(
 
 def query_galion(
     core: Um982Core,
-    rate: int = 1,
+    rate: Union[int, float, None] = 1,
     trigger: Optional[str] = None,
     binary: bool = False,
     add_crlf: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    if trigger and trigger.upper() == "ONCHANGED":
-        command = "GALIONB ONCHANGED" if binary else "GALIONA ONCHANGED"
-    else:
-        command = f"GALIONB {rate}" if binary else f"GALIONA {rate}"
+    command = _ionosphere_log_wire_command("GALION", binary=binary, rate=rate, trigger=trigger)
     check_complete = _ionosphere_complete_checker(9, b"#GALIONA")
     return _run_data_query(
         core,
@@ -490,9 +542,7 @@ def query_galion(
         parse_func=_parse_galion_message,
         binary=binary,
         add_crlf=add_crlf,
-        wait_time=0.5,
-        read_attempts=10,
-        read_timeout=1.5,
+        read_attempts=24,
         check_complete=check_complete,
         result_key="galion",
     )
@@ -500,15 +550,12 @@ def query_galion(
 
 def query_bdsion(
     core: Um982Core,
-    rate: int = 1,
+    rate: Union[int, float, None] = 1,
     trigger: Optional[str] = None,
     binary: bool = False,
     add_crlf: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    if trigger and trigger.upper() == "ONCHANGED":
-        command = "BDSIONB ONCHANGED" if binary else "BDSIONA ONCHANGED"
-    else:
-        command = f"BDSIONB {rate}" if binary else f"BDSIONA {rate}"
+    command = _ionosphere_log_wire_command("BDSION", binary=binary, rate=rate, trigger=trigger)
     check_complete = _ionosphere_complete_checker(4, b"#BDSIONA")
     return _run_data_query(
         core,
@@ -516,9 +563,7 @@ def query_bdsion(
         parse_func=_parse_bdsion_message,
         binary=binary,
         add_crlf=add_crlf,
-        wait_time=0.5,
-        read_attempts=10,
-        read_timeout=1.5,
+        read_attempts=24,
         check_complete=check_complete,
         result_key="bdsion",
     )
@@ -526,15 +571,12 @@ def query_bdsion(
 
 def query_bd3ion(
     core: Um982Core,
-    rate: int = 1,
+    rate: Union[int, float, None] = 1,
     trigger: Optional[str] = None,
     binary: bool = False,
     add_crlf: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    if trigger and trigger.upper() == "ONCHANGED":
-        command = "BD3IONB ONCHANGED" if binary else "BD3IONA ONCHANGED"
-    else:
-        command = f"BD3IONB {rate}" if binary else f"BD3IONA {rate}"
+    command = _ionosphere_log_wire_command("BD3ION", binary=binary, rate=rate, trigger=trigger)
     check_complete = _ionosphere_complete_checker(21, b"#BD3IONA")
     return _run_data_query(
         core,
@@ -542,9 +584,7 @@ def query_bd3ion(
         parse_func=_parse_bd3ion_message,
         binary=binary,
         add_crlf=add_crlf,
-        wait_time=0.5,
-        read_attempts=10,
-        read_timeout=1.5,
+        read_attempts=24,
         check_complete=check_complete,
         result_key="bd3ion",
     )
